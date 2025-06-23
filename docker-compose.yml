@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  trustbooks-backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - STORAGE_BUCKET_NAME=${STORAGE_BUCKET_NAME:-trustbooks-files}
+    volumes:
+      - ./app:/app/app
+      - ./main.py:/app/main.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add a simple test service
+  test:
+    build: .
+    command: ["python", "test_api.py"]
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - STORAGE_BUCKET_NAME=${STORAGE_BUCKET_NAME:-trustbooks-files}
+    depends_on:
+      - trustbooks-backend
+    profiles:
+      - test
