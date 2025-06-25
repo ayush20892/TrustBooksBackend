@@ -46,15 +46,15 @@ async def upload_bank_statement(
         file_path = f"bank_statements/{file_id}_{file.filename}"
         
         # Upload file to Supabase storage
-        try:
-            db.upload_file(
-                file_path=file_path,
-                file_content=file_content,
-                content_type=file.content_type
-            )
-        except Exception as e:
-            logger.error(f"Failed to upload file to storage: {e}")
-            raise HTTPException(status_code=500, detail="Failed to upload file to storage")
+        # try:
+        #     db.upload_file(
+        #         file_path=file_path,
+        #         file_content=file_content,
+        #         content_type=file.content_type
+        #     )
+        # except Exception as e:
+        #     logger.error(f"Failed to upload file to storage: {e}")
+        #     raise HTTPException(status_code=500, detail="Failed to upload file to storage")
         
         # Create initial database record
         statement_data = {

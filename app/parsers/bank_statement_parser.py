@@ -1,3 +1,4 @@
+from io import StringIO
 import logging
 import re
 import pandas as pd
@@ -9,6 +10,7 @@ from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from app.parsers.base_parser import BaseParser
 from app.config import settings
+import csv  # Added for delimiter detection
 
 logger = logging.getLogger(__name__)
 
@@ -210,18 +212,107 @@ class BankStatementParser(BaseParser):
     def parse_csv_statement(self, file_content: bytes) -> List[Dict[str, Any]]:
         """Specialized parsing for CSV bank statements"""
         try:
-            df = pd.read_csv(file_content)
+            # Convert bytes to StringIO for pandas compatibility
+            file_content_str = file_content.decode('utf-8')
+
+            # ------------------------------------------------------------------
+            # Some bank statement exports prepend unstructured metadata (account
+            # info, generation timestamps, disclaimers, etc.) before the actual
+            # transaction table.  We want to locate the first line that contains
+            # the expected table headers and remove everything that appears
+            # before it.  The cleaned CSV string (table_str) is what we give to
+            # pandas.
+            # ------------------------------------------------------------------
+
+            # Split the file into lines for inspection
+            lines: List[str] = file_content_str.splitlines()
+
+            # Keywords that should all be present in the header row (case-insensitive)
+            header_keywords = [
+                "Date",
+                "Narration",
+                "Withdrawal",   # part of "Withdrawal Amt." column
+                "Deposit",      # part of "Deposit Amt." column
+                "Closing Balance"
+            ]
+
+            header_index: Optional[int] = None
+            for idx, line in enumerate(lines):
+                lowered = line.lower()
+                if all(keyword.lower() in lowered for keyword in header_keywords):
+                    header_index = idx
+                    break
+
+            # Separate metadata and table
+            if header_index is not None:
+                _metadata_str = "\n".join(lines[:header_index])  # stored for potential future use
+                # -----------------------------------------------
+                # Extract structured information (account number,
+                # IFSC, email, etc.) from this metadata block so it
+                # can be consumed by the caller if desired.
+                # -----------------------------------------------
+                try:
+                    self.metadata_info = self._extract_metadata_info(_metadata_str)
+                except Exception as meta_err:
+                    logger.debug(f"Metadata extraction failed: {meta_err}")
+                table_str = "\n".join(lines[header_index:])
+            else:
+                # Fallback: assume the entire file is the table
+                _metadata_str = ""
+                table_str = file_content_str
+
+            # ---------------------------------------------------------------
+            # Detect the delimiter dynamically so that quoted commas do not
+            # break the parsing logic (e.g. descriptions that contain commas).
+            # We first try csv.Sniffer; if detection fails we fall back to
+            # common delimiters.  We also ensure that bad lines are skipped so
+            # that an occasional malformed row does not abort the entire parse
+            # routine.
+            # ---------------------------------------------------------------
+
+            detected_delim = ","  # sensible default
+            try:
+                # Use csv.Sniffer to guess the delimiter from a sample
+                potential = csv.Sniffer().sniff(table_str, delimiters=",\t;|")
+                detected_delim = potential.delimiter
+            except csv.Error:
+                # Use the header line (if identified) or the first line in the file
+                header_line = lines[header_index] if header_index is not None else lines[0]
+                if "\t" in header_line:
+                    detected_delim = "\t"
+
+            try:
+                df = pd.read_csv(
+                    StringIO(table_str),
+                    delimiter=detected_delim,
+                    engine="python",
+                    on_bad_lines="skip",  # pandas >= 1.3
+                )
+            except Exception as e:
+                logger.error(
+                    f"Primary CSV read failed with delimiter '{detected_delim}': {e}. Falling back to regex separator."
+                )
+                # Fallback to regex separator that handles both comma and tab,
+                # but ignore quoting issues by skipping bad lines.
+                df = pd.read_csv(
+                    StringIO(table_str),
+                    sep=r",|\t",
+                    engine="python",
+                    on_bad_lines="skip",
+                )
             transactions = []
             
             # Common column mappings
             column_mappings = {
                 'date': ['Date', 'Transaction Date', 'Txn Date', 'DATE'],
                 'description': ['Description', 'Narration', 'Particulars', 'DESCRIPTION'],
-                'debit': ['Debit', 'Withdrawal', 'DR', 'DEBIT'],
-                'credit': ['Credit', 'Deposit', 'CR', 'CREDIT'],
+                'refId': ['Chq./Ref.No.'],
+                'debit': ['Debit', 'Withdrawal', 'DR', 'DEBIT', 'Withdrawal Amt.'],
+                'credit': ['Credit', 'Deposit', 'CR', 'CREDIT', 'Deposit Amt.'],
                 'balance': ['Balance', 'Closing Balance', 'BALANCE'],
                 'account': ['Account', 'Account Number', 'ACC NO', 'ACCOUNT']
             }
+            
             
             # Map columns
             mapped_columns = {}
@@ -242,7 +333,7 @@ class BankStatementParser(BaseParser):
                         if pd.notna(date_val):
                             if isinstance(date_val, str):
                                 # Try to parse date
-                                transaction['txn_date'] = self._parse_date_string(date_val)
+                                transaction['date'] = self._parse_date_string(date_val)
                     except:
                         pass
                 
@@ -285,7 +376,14 @@ class BankStatementParser(BaseParser):
                         if re.match(r'\d+', acc_str):
                             transaction['account_number'] = acc_str
                 
-                if transaction:  # Only add if we have some data
+                # Add the row only if it has a valid date *and* at least one
+                # monetary value (debit or credit).  This prevents inclusion
+                # of header lines or rows that have no financial impact.
+                date_ok = transaction.get("date") is not None
+                amount_ok = (transaction.get("debit") is not None) or (
+                    transaction.get("credit") is not None
+                )
+                if date_ok and amount_ok:
                     transactions.append(transaction)
             
             return transactions
@@ -312,4 +410,42 @@ class BankStatementParser(BaseParser):
             
             return None
         except:
-            return None 
+            return None
+
+    # ------------------------------------------------------------------
+    #                     METADATA EXTRACTION HELPERS
+    # ------------------------------------------------------------------
+    def _extract_metadata_info(self, meta_str: str) -> Dict[str, Any]:
+        """Pull key–value pairs from the unstructured header section."""
+        info: Dict[str, Any] = {}
+
+        # Account number
+        if (m := re.search(r"Account\s*No\s*:?\s*(\d+)", meta_str, re.IGNORECASE)):
+            info["account_number"] = m.group(1)
+
+        # IFSC code (standard 11-char pattern)
+        if (m := re.search(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", meta_str)):
+            info["ifsc"] = m.group(0)
+
+        # Customer ID
+        if (m := re.search(r"Cust\s*ID\s*:?\s*(\d+)", meta_str, re.IGNORECASE)):
+            info["customer_id"] = m.group(1)
+
+        # Email
+        if (m := re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", meta_str)):
+            info["email"] = m.group(0)
+
+        # Statement date range
+        if (m := re.search(r"Statement\s+From\s*:?\s*([0-9/]{6,10})\s*To\s*:?\s*([0-9/]{6,10})", meta_str, re.IGNORECASE)):
+            info["statement_from"] = self._parse_date_string(m.group(1)) or m.group(1)
+            info["statement_to"] = self._parse_date_string(m.group(2)) or m.group(2)
+
+        # Address (first line after 'Address :')
+        if (m := re.search(r"Address\s*:?\s*([^,\n]+)", meta_str, re.IGNORECASE)):
+            info["address"] = m.group(1).strip()
+
+        # Joint holders
+        if (m := re.search(r"JOINT\s+HOLDERS\s*:?\s*([^,\n]+)", meta_str, re.IGNORECASE)):
+            info["joint_holders"] = m.group(1).strip()
+
+        return info 

@@ -23,7 +23,7 @@ app = FastAPI(
 )
 
 # Add debug middleware
-app.add_middleware(DebugMiddleware)
+# app.add_middleware(DebugMiddleware)
 
 # CORS middleware
 app.add_middleware(
